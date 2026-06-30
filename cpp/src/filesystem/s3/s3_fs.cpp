@@ -53,7 +53,9 @@ static std::unordered_map<std::string, S3LogLevel> LogLevel_Map = {
     {"off", S3LogLevel::Off},   {"fatal", S3LogLevel::Fatal}, {"error", S3LogLevel::Error}, {"warn", S3LogLevel::Warn},
     {"info", S3LogLevel::Info}, {"debug", S3LogLevel::Debug}, {"trace", S3LogLevel::Trace}};
 
+#ifdef MILVUS_GCP_FS
 static const char* GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG = "GoogleHttpClientFactory";
+#endif
 static const char* TLS_FACTORY_ALLOCATION_TAG = "TlsHttpClientFactory";
 
 // Convert tls_min_version string to CURLOPT_SSLVERSION value.
@@ -124,6 +126,7 @@ class TlsHttpClientFactory : public Aws::Http::HttpClientFactory {
   std::string tls_min_version_;
 };
 
+#ifdef MILVUS_GCP_FS
 class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
   public:
   explicit GoogleHttpClientFactory(std::shared_ptr<google::cloud::oauth2_internal::Credentials> credentials,
@@ -168,6 +171,7 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
   std::shared_ptr<google::cloud::oauth2_internal::Credentials> credentials_;
   std::string tls_min_version_;
 };
+#endif
 
 void S3FileSystemProducer::InitS3() {
   static std::once_flag s3_init_flag;
@@ -179,6 +183,7 @@ void S3FileSystemProducer::InitS3() {
     std::string tls_min_ver = (config_.use_ssl && !config_.tls_min_version.empty()) ? config_.tls_min_version : "";
 
     if (config_.cloud_provider == "gcp" && config_.use_iam) {
+#ifdef MILVUS_GCP_FS
       Aws::HttpOptions http_options;
       http_options.httpClientFactory_create_fn = [tls_min_ver]() {
         auto credentials =
@@ -187,6 +192,9 @@ void S3FileSystemProducer::InitS3() {
       };
       global_options.http_options = http_options;
       global_options.override_default_http_options = true;
+#else
+      throw std::invalid_argument("GCP IAM S3 filesystem requires MILVUS_GCP_FS");
+#endif
     } else if (!tls_min_ver.empty()) {
       // Non-GCP S3-compatible providers with TLS version override (only when use_ssl=true)
       Aws::HttpOptions http_options;

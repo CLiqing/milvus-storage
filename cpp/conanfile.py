@@ -42,6 +42,7 @@ class StorageConan(ConanFile):
         "with_jni": False,
         "with_python_binding": False,
         "aws-sdk-cpp:config": True,
+        "aws-sdk-cpp:s3-crt": True,
         "aws-sdk-cpp:text-to-speech": False,
         "aws-sdk-cpp:transfer": False,
         "arrow:with_s3": True,

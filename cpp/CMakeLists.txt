@@ -10,6 +10,7 @@ option(WITH_UT "Build the testing tree." OFF)
 option(WITH_ASAN "Build with address sanitizer." OFF)
 option(WITH_BENCHMARK "Build with micro benchmark." OFF)
 option(WITH_AZURE_FS "Build with azure file system." ON)
+option(WITH_GCP_FS "Build with GCP S3-compatible filesystem support." ON)
 option(WITH_VORTEX "Build with vortex." OFF)
 option(WITH_JNI "Build with JNI library." OFF)
 option(WITH_PYTHON_BINDING "Build for Python bindings with hidden symbols." OFF)
@@ -27,14 +28,20 @@ if (WITH_AZURE_FS)
   add_compile_definitions(MILVUS_AZURE_FS)
 endif()
 
+if (WITH_GCP_FS)
+  add_compile_definitions(MILVUS_GCP_FS)
+endif()
 
 find_package(Boost REQUIRED)
 
 find_package(Arrow REQUIRED)
+find_package(CURL REQUIRED)
 include_directories(${Arrow_INCLUDE_DIRS})
 
 find_package(Protobuf REQUIRED)
-find_package(google-cloud-cpp REQUIRED)
+if (WITH_GCP_FS)
+  find_package(google-cloud-cpp REQUIRED)
+endif()
 find_package(libavrocpp REQUIRED)
 
 if (WITH_VORTEX) 
@@ -65,8 +72,13 @@ list(FILTER ALL_SRC_FILES EXCLUDE REGEX ".*/src/format/vortex/vx-bridge/.*\\.(cp
 list(FILTER ALL_SRC_FILES EXCLUDE REGEX ".*/src/jni/.*\\.cpp$")
 
 add_library(milvus-storage SHARED ${ALL_SRC_FILES})
+set_source_files_properties(src/filesystem/s3/multi_part_upload_s3_fs.cpp
+  PROPERTIES COMPILE_OPTIONS "-std=gnu++20;-fcoroutines")
 
-list(APPEND LINK_LIBS arrow::arrow Boost::boost protobuf::protobuf AWS::aws-sdk-cpp-identity-management google-cloud-cpp::storage libavrocpp::libavrocpp)
+list(APPEND LINK_LIBS arrow::arrow Boost::boost protobuf::protobuf AWS::aws-sdk-cpp-identity-management AWS::aws-sdk-cpp-s3 AWS::aws-sdk-cpp-s3-crt libavrocpp::libavrocpp CURL::libcurl)
+if (WITH_GCP_FS)
+  list(APPEND LINK_LIBS google-cloud-cpp::storage)
+endif()
 list(APPEND INLCUDE_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_link_libraries(milvus-storage PUBLIC ${LINK_LIBS})

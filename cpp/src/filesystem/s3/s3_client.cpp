@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,6 +37,7 @@
 #include <aws/core/client/DefaultRetryStrategy.h>
 #include <aws/core/client/RetryStrategy.h>
 #include <aws/core/http/HttpResponse.h>
+#include <aws/core/utils/threading/PooledThreadExecutor.h>
 #include <aws/core/utils/xml/XmlSerializer.h>
 #include <aws/core/internal/AWSHttpResourceClient.h>
 #include <aws/s3/S3Client.h>
@@ -63,6 +66,36 @@ using ::milvus_storage::fs::internal::FromAwsString;
 using ::milvus_storage::fs::internal::ToAwsString;
 
 namespace milvus_storage {
+
+namespace {
+
+bool IsEnvEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return false;
+  }
+  std::string text(value);
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return text == "1" || text == "true" || text == "on" || text == "yes";
+}
+
+uint64_t GetUnsignedEnv(const char* name, uint64_t default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return default_value;
+  }
+  try {
+    size_t parsed = 0;
+    auto result = std::stoull(value, &parsed, 10);
+    return parsed == std::string(value).size() ? result : default_value;
+  } catch (...) {
+    return default_value;
+  }
+}
+
+}  // namespace
 
 namespace S3Model = Aws::S3::Model;
 static inline constexpr auto kBucketRegionHeaderName = "x-amz-bucket-region";
@@ -547,6 +580,15 @@ arrow::Result<std::shared_ptr<S3ClientHolder>> ClientBuilder::BuildClient(
   }
 
   client_config_.maxConnections = std::max(client_config_.maxConnections, options_.max_connections);
+  if (IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC") &&
+      !IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE") &&
+      !IsEnvEnabled("MILVUS_S3_CLIENT_CRT")) {
+    auto executor_threads =
+        static_cast<size_t>(std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_ASYNC_EXECUTOR_THREADS",
+                                                                 client_config_.maxConnections)));
+    client_config_.executor =
+        Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>("MilvusS3AsyncExecutor", executor_threads);
+  }
 
   const bool use_virtual_addressing = options_.endpoint_override.empty() || options_.force_virtual_addressing;
 

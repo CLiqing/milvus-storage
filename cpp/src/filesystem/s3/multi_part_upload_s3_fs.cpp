@@ -16,10 +16,25 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <atomic>
+#include <cmath>
+#include <coroutine>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <iostream>
+#include <unordered_map>
+
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
 #include <shared_mutex>
 #include <thread>
 
@@ -38,15 +53,24 @@
 #include <aws/core/Aws.h>
 #include <aws/core/Region.h>
 #include <aws/core/VersionConfig.h>
+#include <aws/core/auth/signer/AWSAuthV4Signer.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
+#include <aws/core/http/HttpRequest.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
+#include <aws/core/http/URI.h>
+#include <aws/core/http/standard/StandardHttpRequest.h>
 #include <aws/core/client/RetryStrategy.h>
 #include <aws/core/http/HttpResponse.h>
 #include <aws/core/utils/logging/ConsoleLogSystem.h>
 #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
+#include <aws/crt/io/Bootstrap.h>
+#include <aws/crt/io/EventLoopGroup.h>
+#include <aws/crt/io/HostResolver.h>
 #include <aws/core/utils/xml/XmlSerializer.h>
+#include <aws/s3-crt/S3CrtClient.h>
+#include <aws/s3-crt/model/GetObjectRequest.h>
 #include <aws/identity-management/auth/STSAssumeRoleCredentialsProvider.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
@@ -65,6 +89,7 @@
 #include <aws/s3/model/ListBucketsResult.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/ObjectCannedACL.h>
+#include <curl/curl.h>
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
 
@@ -77,6 +102,7 @@
 
 static constexpr const char kSep = '/';
 
+using ::arrow::ResizableBuffer;
 using ::arrow::Buffer;
 using ::arrow::Future;
 using ::arrow::Result;
@@ -104,6 +130,177 @@ using ::milvus_storage::fs::internal::S3Backend;
 using ::milvus_storage::fs::internal::ToAwsString;
 
 namespace S3Model = Aws::S3::Model;
+
+namespace {
+
+struct S3ReadPathContext {
+  bool override_enabled = false;
+  std::string mode;
+  uint64_t max_inflight = 0;
+  uint64_t event_loops = 0;
+  uint64_t crt_max_connections = 0;
+  double crt_throughput_gbps = 0.0;
+  bool has_crt_throughput_gbps = false;
+};
+
+bool IsEnvEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return false;
+  }
+  std::string text(value);
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return text == "1" || text == "true" || text == "on" || text == "yes";
+}
+
+uint64_t GetUnsignedEnv(const char* name, uint64_t default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return default_value;
+  }
+  try {
+    size_t parsed = 0;
+    auto result = std::stoull(value, &parsed, 10);
+    return parsed == std::string(value).size() ? result : default_value;
+  } catch (...) {
+    return default_value;
+  }
+}
+
+double GetDoubleEnv(const char* name, double default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return default_value;
+  }
+  try {
+    size_t parsed = 0;
+    auto result = std::stod(value, &parsed);
+    return parsed == std::string(value).size() ? result : default_value;
+  } catch (...) {
+    return default_value;
+  }
+}
+
+bool IsS3ReadPathContextEnabled(const S3ReadPathContext& context, const char* name) {
+  if (!context.override_enabled) {
+    return false;
+  }
+  if (std::strcmp(name, "MILVUS_S3_GETOBJECT_ASYNC") == 0) {
+    return context.mode == "curl_multi" || context.mode == "crt";
+  }
+  if (std::strcmp(name, "MILVUS_S3_CLIENT_COROUTINE") == 0) {
+    return context.mode == "curl_multi";
+  }
+  if (std::strcmp(name, "MILVUS_S3_CLIENT_CRT") == 0) {
+    return context.mode == "crt";
+  }
+  return false;
+}
+
+bool IsEnvEnabled(const char* name, const S3ReadPathContext& context) {
+  if (IsS3ReadPathContextEnabled(context, name)) {
+    return true;
+  }
+  if (context.override_enabled &&
+      (std::strcmp(name, "MILVUS_S3_GETOBJECT_ASYNC") == 0 ||
+       std::strcmp(name, "MILVUS_S3_CLIENT_COROUTINE") == 0 ||
+       std::strcmp(name, "MILVUS_S3_CLIENT_CRT") == 0)) {
+    return false;
+  }
+  return IsEnvEnabled(name);
+}
+
+uint64_t GetUnsignedS3ReadPathContext(const S3ReadPathContext& context, const char* name, uint64_t default_value) {
+  if (!context.override_enabled) {
+    return default_value;
+  }
+  if (std::strcmp(name, "MILVUS_S3_ASYNC_MAX_INFLIGHT") == 0 &&
+      context.max_inflight > 0) {
+    return context.max_inflight;
+  }
+  if ((std::strcmp(name, "MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS") == 0 ||
+       std::strcmp(name, "MILVUS_S3_CLIENT_CRT_EVENTLOOPS") == 0) &&
+      context.event_loops > 0) {
+    return context.event_loops;
+  }
+  if (std::strcmp(name, "MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS") == 0 &&
+      context.crt_max_connections > 0) {
+    return context.crt_max_connections;
+  }
+  return default_value;
+}
+
+uint64_t GetUnsignedEnv(const char* name, uint64_t default_value, const S3ReadPathContext& context) {
+  auto context_value = GetUnsignedS3ReadPathContext(context, name, default_value);
+  if (context_value != default_value) {
+    return context_value;
+  }
+  return GetUnsignedEnv(name, default_value);
+}
+
+double GetDoubleS3ReadPathContext(const S3ReadPathContext& context, const char* name, double default_value) {
+  if (context.override_enabled &&
+      std::strcmp(name, "MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS") == 0 &&
+      context.has_crt_throughput_gbps) {
+    return context.crt_throughput_gbps;
+  }
+  return default_value;
+}
+
+double GetDoubleEnv(const char* name, double default_value, const S3ReadPathContext& context) {
+  auto context_value = GetDoubleS3ReadPathContext(context, name, default_value);
+  if (context_value != default_value) {
+    return context_value;
+  }
+  return GetDoubleEnv(name, default_value);
+}
+
+bool IsS3ReadPathLogEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MILVUS_S3_READ_PATH_LOG");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+void PrintS3ReadPathSelection(const char* selected_path,
+                              const S3ReadPathContext& context,
+                              int64_t position,
+                              int64_t nbytes) {
+  if (!context.override_enabled) {
+    return;
+  }
+  if (!IsS3ReadPathLogEnabled()) {
+    return;
+  }
+  static std::atomic<uint64_t> last_print_us{0};
+  const auto now_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  auto last_us = last_print_us.load(std::memory_order_relaxed);
+  if (last_us != 0 && now_us <= last_us + 1000000) {
+    return;
+  }
+  if (!last_print_us.compare_exchange_strong(
+          last_us, now_us, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    return;
+  }
+  std::cerr << "[MILVUS_S3_READ_PATH]"
+            << " layer=milvus_storage_s3"
+            << " requested_mode=" << context.mode
+            << " selected_path=" << selected_path
+            << " max_inflight=" << context.max_inflight
+            << " eventloops=" << context.event_loops
+            << " crt_max_connections=" << context.crt_max_connections
+            << " crt_throughput_gbps=" << context.crt_throughput_gbps
+            << " position=" << position
+            << " nbytes=" << nbytes
+            << std::endl;
+}
+
+}  // namespace
 
 namespace milvus_storage {
 // -----------------------------------------------------------------------
@@ -323,6 +520,767 @@ Aws::IOStreamFactory AwsWriteableStreamFactory(void* data, int64_t nbytes) {
   return [=]() { return Aws::New<StringViewStream>("", data, nbytes); };
 }
 
+using MilvusStorageReadAsyncIntoCallback = void (*)(void* callback_ctx,
+                                                    int64_t bytes_read,
+                                                    const char* error_message);
+
+struct CurlMultiResult {
+  bool ok = false;
+  int64_t bytes = 0;
+  long http_status = 0;
+  std::string error;
+};
+
+struct CurlMultiRequest {
+  std::string url;
+  std::vector<std::string> headers;
+  std::shared_ptr<ResizableBuffer> buffer;
+  void* output = nullptr;
+  int64_t capacity = 0;
+  int64_t bytes = 0;
+  long connect_timeout_ms = 0;
+  long request_timeout_ms = 0;
+  curl_slist* curl_headers = nullptr;
+  CURL* easy = nullptr;
+  char error_buffer[CURL_ERROR_SIZE] = {0};
+  CurlMultiResult result;
+  std::coroutine_handle<> continuation;
+  std::shared_ptr<S3ClientLock> client_lock_holder;
+
+  ~CurlMultiRequest() {
+    if (curl_headers != nullptr) {
+      curl_slist_free_all(curl_headers);
+    }
+  }
+};
+
+struct DetachedCurlTask {
+  struct promise_type {
+    DetachedCurlTask get_return_object() { return {}; }
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    std::suspend_never final_suspend() noexcept { return {}; }
+    void return_void() noexcept {}
+    void unhandled_exception() { std::terminate(); }
+  };
+};
+
+class CurlMultiReadExecutor {
+ public:
+  explicit CurlMultiReadExecutor(size_t event_loop_count) {
+    static std::once_flag curl_global_init_once;
+    std::call_once(curl_global_init_once, []() { curl_global_init(CURL_GLOBAL_DEFAULT); });
+
+    event_loop_count = std::max<size_t>(event_loop_count, 1);
+    loops_.reserve(event_loop_count);
+    for (size_t i = 0; i < event_loop_count; ++i) {
+      loops_.push_back(std::make_unique<Loop>(*this));
+    }
+    for (auto& loop : loops_) {
+      loop->Start();
+    }
+  }
+
+  ~CurlMultiReadExecutor() {
+    for (auto& loop : loops_) {
+      loop->Stop();
+    }
+  }
+
+  class Awaitable {
+   public:
+    Awaitable(CurlMultiReadExecutor& owner, std::shared_ptr<CurlMultiRequest> request)
+        : owner_(owner), request_(std::move(request)) {}
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> continuation) {
+      request_->continuation = continuation;
+      owner_.Submit(request_);
+    }
+
+    CurlMultiResult await_resume() { return std::move(request_->result); }
+
+   private:
+    CurlMultiReadExecutor& owner_;
+    std::shared_ptr<CurlMultiRequest> request_;
+  };
+
+  Awaitable GetObject(std::shared_ptr<CurlMultiRequest> request) {
+    return Awaitable(*this, std::move(request));
+  }
+
+ private:
+  class Loop {
+   public:
+    explicit Loop(CurlMultiReadExecutor& owner) : owner_(owner) {
+      epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+      if (epoll_fd_ < 0) {
+        throw std::runtime_error(std::string("epoll_create1 failed: ") + std::strerror(errno));
+      }
+      event_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+      if (event_fd_ < 0) {
+        throw std::runtime_error(std::string("eventfd failed: ") + std::strerror(errno));
+      }
+      timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+      if (timer_fd_ < 0) {
+        throw std::runtime_error(std::string("timerfd_create failed: ") + std::strerror(errno));
+      }
+      multi_ = curl_multi_init();
+      if (multi_ == nullptr) {
+        throw std::runtime_error("curl_multi_init failed");
+      }
+      curl_multi_setopt(multi_, CURLMOPT_SOCKETFUNCTION, &Loop::SocketCallback);
+      curl_multi_setopt(multi_, CURLMOPT_SOCKETDATA, this);
+      curl_multi_setopt(multi_, CURLMOPT_TIMERFUNCTION, &Loop::TimerCallback);
+      curl_multi_setopt(multi_, CURLMOPT_TIMERDATA, this);
+      AddFd(event_fd_, EPOLLIN);
+      AddFd(timer_fd_, EPOLLIN);
+    }
+
+    ~Loop() {
+      Stop();
+      if (multi_ != nullptr) {
+        curl_multi_cleanup(multi_);
+        multi_ = nullptr;
+      }
+      if (timer_fd_ >= 0) {
+        close(timer_fd_);
+      }
+      if (event_fd_ >= 0) {
+        close(event_fd_);
+      }
+      if (epoll_fd_ >= 0) {
+        close(epoll_fd_);
+      }
+    }
+
+    void Start() { thread_ = std::thread([this]() { Run(); }); }
+
+    void Stop() {
+      bool expected = false;
+      if (stopping_.compare_exchange_strong(expected, true)) {
+        Wake();
+      }
+      if (thread_.joinable()) {
+        thread_.join();
+      }
+    }
+
+    void Submit(std::shared_ptr<CurlMultiRequest> request) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.push_back(std::move(request));
+      }
+      Wake();
+    }
+
+   private:
+    static size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+      auto* request = static_cast<CurlMultiRequest*>(userdata);
+      const size_t bytes = size * nmemb;
+      if (bytes == 0) {
+        return 0;
+      }
+      if (request->bytes + static_cast<int64_t>(bytes) > request->capacity) {
+        return 0;
+      }
+      auto* output = request->output != nullptr
+                         ? static_cast<uint8_t*>(request->output)
+                         : request->buffer->mutable_data();
+      std::memcpy(output + request->bytes, ptr, bytes);
+      request->bytes += static_cast<int64_t>(bytes);
+      return bytes;
+    }
+
+    static int SocketCallback(CURL*, curl_socket_t socket, int what, void* userp, void*) {
+      auto* loop = static_cast<Loop*>(userp);
+      if (what == CURL_POLL_REMOVE) {
+        loop->RemoveSocket(socket);
+        return 0;
+      }
+
+      uint32_t events = 0;
+      if ((what & CURL_POLL_IN) != 0) {
+        events |= EPOLLIN;
+      }
+      if ((what & CURL_POLL_OUT) != 0) {
+        events |= EPOLLOUT;
+      }
+      events |= EPOLLERR | EPOLLHUP;
+      loop->UpdateSocket(socket, events);
+      return 0;
+    }
+
+    static int TimerCallback(CURLM*, long timeout_ms, void* userp) {
+      static_cast<Loop*>(userp)->SetTimer(timeout_ms);
+      return 0;
+    }
+
+    void AddFd(int fd, uint32_t events) {
+      epoll_event event{};
+      event.events = events;
+      event.data.fd = fd;
+      if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) != 0) {
+        throw std::runtime_error(std::string("epoll_ctl add failed: ") + std::strerror(errno));
+      }
+    }
+
+    void UpdateSocket(curl_socket_t socket, uint32_t events) {
+      epoll_event event{};
+      event.events = events;
+      event.data.fd = socket;
+      int op = sockets_.count(socket) == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+      if (epoll_ctl(epoll_fd_, op, socket, &event) == 0) {
+        sockets_[socket] = events;
+      }
+    }
+
+    void RemoveSocket(curl_socket_t socket) {
+      if (sockets_.erase(socket) != 0) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, socket, nullptr);
+      }
+    }
+
+    void SetTimer(long timeout_ms) {
+      itimerspec timer{};
+      if (timeout_ms >= 0) {
+        if (timeout_ms == 0) {
+          timer.it_value.tv_nsec = 1;
+        } else {
+          timer.it_value.tv_sec = timeout_ms / 1000;
+          timer.it_value.tv_nsec = (timeout_ms % 1000) * 1000000;
+        }
+      }
+      timerfd_settime(timer_fd_, 0, &timer, nullptr);
+    }
+
+    void Wake() {
+      uint64_t value = 1;
+      ssize_t ignored = write(event_fd_, &value, sizeof(value));
+      (void)ignored;
+    }
+
+    void DrainFd(int fd) {
+      uint64_t value = 0;
+      while (read(fd, &value, sizeof(value)) == sizeof(value)) {
+      }
+    }
+
+    void Run() {
+      while (true) {
+        if (AddPending()) {
+          int running = 0;
+          curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &running);
+          CompleteFinished();
+        }
+
+        if (stopping_.load(std::memory_order_relaxed) && active_.empty() && PendingEmpty()) {
+          break;
+        }
+
+        epoll_event events[64];
+        int count = epoll_wait(epoll_fd_, events, 64, -1);
+        if (count < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          break;
+        }
+
+        for (int i = 0; i < count; ++i) {
+          int fd = events[i].data.fd;
+          if (fd == event_fd_) {
+            DrainFd(event_fd_);
+            if (AddPending()) {
+              int running = 0;
+              curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &running);
+              CompleteFinished();
+            }
+            continue;
+          }
+          if (fd == timer_fd_) {
+            DrainFd(timer_fd_);
+            int running = 0;
+            curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &running);
+            CompleteFinished();
+            continue;
+          }
+
+          int flags = 0;
+          if ((events[i].events & EPOLLIN) != 0) {
+            flags |= CURL_CSELECT_IN;
+          }
+          if ((events[i].events & EPOLLOUT) != 0) {
+            flags |= CURL_CSELECT_OUT;
+          }
+          if ((events[i].events & (EPOLLERR | EPOLLHUP)) != 0) {
+            flags |= CURL_CSELECT_ERR;
+          }
+          int running = 0;
+          curl_multi_socket_action(multi_, fd, flags, &running);
+          CompleteFinished();
+        }
+      }
+    }
+
+    bool PendingEmpty() {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return pending_.empty();
+    }
+
+    bool AddPending() {
+      std::deque<std::shared_ptr<CurlMultiRequest>> local;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        local.swap(pending_);
+      }
+
+      for (auto& request : local) {
+        StartRequest(std::move(request));
+      }
+      return !local.empty();
+    }
+
+    void StartRequest(std::shared_ptr<CurlMultiRequest> request) {
+      request->easy = curl_easy_init();
+      if (request->easy == nullptr) {
+        FinishWithoutCurl(std::move(request), "curl_easy_init failed");
+        return;
+      }
+      for (const auto& header : request->headers) {
+        request->curl_headers = curl_slist_append(request->curl_headers, header.c_str());
+      }
+
+      curl_easy_setopt(request->easy, CURLOPT_URL, request->url.c_str());
+      curl_easy_setopt(request->easy, CURLOPT_HTTPGET, 1L);
+      curl_easy_setopt(request->easy, CURLOPT_HTTPHEADER, request->curl_headers);
+      curl_easy_setopt(request->easy, CURLOPT_WRITEFUNCTION, &Loop::WriteCallback);
+      curl_easy_setopt(request->easy, CURLOPT_WRITEDATA, request.get());
+      curl_easy_setopt(request->easy, CURLOPT_PRIVATE, request.get());
+      curl_easy_setopt(request->easy, CURLOPT_ERRORBUFFER, request->error_buffer);
+      curl_easy_setopt(request->easy, CURLOPT_NOSIGNAL, 1L);
+      curl_easy_setopt(request->easy, CURLOPT_SSL_VERIFYPEER, 1L);
+      curl_easy_setopt(request->easy, CURLOPT_SSL_VERIFYHOST, 2L);
+      if (request->connect_timeout_ms > 0) {
+        curl_easy_setopt(request->easy, CURLOPT_CONNECTTIMEOUT_MS, request->connect_timeout_ms);
+      }
+      if (request->request_timeout_ms > 0) {
+        curl_easy_setopt(request->easy, CURLOPT_TIMEOUT_MS, request->request_timeout_ms);
+      }
+
+      CURLMcode code = curl_multi_add_handle(multi_, request->easy);
+      if (code != CURLM_OK) {
+        std::string error = curl_multi_strerror(code);
+        curl_easy_cleanup(request->easy);
+        request->easy = nullptr;
+        FinishWithoutCurl(std::move(request), error);
+        return;
+      }
+      active_[request->easy] = std::move(request);
+    }
+
+    void CompleteFinished() {
+      int messages = 0;
+      CURLMsg* message = nullptr;
+      while ((message = curl_multi_info_read(multi_, &messages)) != nullptr) {
+        if (message->msg != CURLMSG_DONE) {
+          continue;
+        }
+
+        CURL* easy = message->easy_handle;
+        auto iter = active_.find(easy);
+        if (iter == active_.end()) {
+          curl_multi_remove_handle(multi_, easy);
+          curl_easy_cleanup(easy);
+          continue;
+        }
+
+        auto request = std::move(iter->second);
+        active_.erase(iter);
+        curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &request->result.http_status);
+        if (message->data.result == CURLE_OK && request->result.http_status >= 200 &&
+            request->result.http_status < 300) {
+          request->result.ok = true;
+          request->result.bytes = request->bytes;
+        } else {
+          request->result.ok = false;
+          const char* curl_error = request->error_buffer[0] != '\0' ? request->error_buffer
+                                                                    : curl_easy_strerror(message->data.result);
+          request->result.error =
+              std::string(curl_error) + " http=" + std::to_string(request->result.http_status);
+        }
+        curl_multi_remove_handle(multi_, easy);
+        curl_easy_cleanup(easy);
+        request->easy = nullptr;
+        Resume(std::move(request));
+      }
+    }
+
+    void FinishWithoutCurl(std::shared_ptr<CurlMultiRequest> request, const std::string& error) {
+      request->result.ok = false;
+      request->result.error = error;
+      Resume(std::move(request));
+    }
+
+    void Resume(std::shared_ptr<CurlMultiRequest> request) {
+      auto continuation = request->continuation;
+      if (continuation) {
+        continuation.resume();
+      }
+    }
+
+    CurlMultiReadExecutor& owner_;
+    CURLM* multi_ = nullptr;
+    int epoll_fd_ = -1;
+    int event_fd_ = -1;
+    int timer_fd_ = -1;
+    std::thread thread_;
+    std::atomic<bool> stopping_{false};
+    std::mutex mutex_;
+    std::deque<std::shared_ptr<CurlMultiRequest>> pending_;
+    std::unordered_map<CURL*, std::shared_ptr<CurlMultiRequest>> active_;
+    std::unordered_map<curl_socket_t, uint32_t> sockets_;
+  };
+
+  void Submit(std::shared_ptr<CurlMultiRequest> request) {
+    size_t index = next_loop_.fetch_add(1, std::memory_order_relaxed) % loops_.size();
+    loops_[index]->Submit(std::move(request));
+  }
+
+  std::vector<std::unique_ptr<Loop>> loops_;
+  std::atomic<size_t> next_loop_{0};
+};
+
+std::shared_ptr<CurlMultiReadExecutor> GetCurlMultiReadExecutor(const S3ReadPathContext& context) {
+  static std::mutex mutex;
+  static std::shared_ptr<CurlMultiReadExecutor> executor;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!executor) {
+    auto event_loops = static_cast<size_t>(
+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_COROUTINE_EVENTLOOPS", 2, context)));
+    executor = std::make_shared<CurlMultiReadExecutor>(event_loops);
+  }
+  return executor;
+}
+
+std::string StripEndpointScheme(std::string endpoint) {
+  const std::string https_prefix = "https://";
+  const std::string http_prefix = "http://";
+  if (endpoint.rfind(https_prefix, 0) == 0) {
+    endpoint = endpoint.substr(https_prefix.size());
+  } else if (endpoint.rfind(http_prefix, 0) == 0) {
+    endpoint = endpoint.substr(http_prefix.size());
+  }
+  while (!endpoint.empty() && endpoint.back() == '/') {
+    endpoint.pop_back();
+  }
+  return endpoint;
+}
+
+std::string DefaultS3Endpoint(const std::string& region) {
+  return "s3." + (region.empty() ? std::string("us-east-1") : region) + ".amazonaws.com";
+}
+
+arrow::Result<std::shared_ptr<CurlMultiRequest>> BuildCurlMultiGetObjectRequest(
+    const S3Options& options,
+    const S3Path& path,
+    int64_t position,
+    int64_t nbytes,
+    const std::shared_ptr<ResizableBuffer>& buffer,
+    void* output,
+    std::shared_ptr<S3ClientLock> client_lock_holder) {
+  if (options.cloud_provider != "aws") {
+    return arrow::Status::NotImplemented("curl_multi GetObject demo currently supports AWS S3 only");
+  }
+  if (!options.credentials_provider) {
+    return arrow::Status::Invalid("curl_multi GetObject requires an AWS credentials provider");
+  }
+
+  auto credentials = options.credentials_provider->GetAWSCredentials();
+  if (credentials.GetAWSAccessKeyId().empty() || credentials.GetAWSSecretKey().empty()) {
+    return arrow::Status::Invalid("curl_multi GetObject requires non-empty AWS credentials");
+  }
+
+  std::string endpoint = StripEndpointScheme(options.endpoint_override.empty()
+                                                 ? DefaultS3Endpoint(options.region)
+                                                 : options.endpoint_override);
+  const bool use_virtual_addressing = options.endpoint_override.empty() || options.force_virtual_addressing;
+  Aws::Http::URI uri;
+  uri.SetScheme(options.scheme == "http" ? Aws::Http::Scheme::HTTP : Aws::Http::Scheme::HTTPS);
+  if (use_virtual_addressing) {
+    uri.SetAuthority((path.bucket + "." + endpoint).c_str());
+    uri.SetPath(("/" + path.key).c_str());
+  } else {
+    uri.SetAuthority(endpoint.c_str());
+    uri.SetPath(("/" + path.bucket + "/" + path.key).c_str());
+  }
+
+  Aws::Http::Standard::StandardHttpRequest http_request(uri, Aws::Http::HttpMethod::HTTP_GET);
+  http_request.SetHeaderValue("range", FormatRange(position, nbytes).c_str());
+
+  auto provider = Aws::MakeShared<Aws::Auth::SimpleAWSCredentialsProvider>(
+      "MilvusS3CurlMultiCredentials", credentials);
+  Aws::Client::AWSAuthV4Signer signer(provider,
+                                      "s3",
+                                      options.region.empty() ? Aws::Region::US_EAST_1 : options.region.c_str(),
+                                      Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+                                      false);
+  if (!signer.SignRequest(http_request,
+                          options.region.empty() ? Aws::Region::US_EAST_1 : options.region.c_str(),
+                          "s3",
+                          false)) {
+    return arrow::Status::IOError("curl_multi GetObject SigV4 signing failed");
+  }
+
+  auto request = std::make_shared<CurlMultiRequest>();
+  request->url = http_request.GetURIString(true).c_str();
+  request->buffer = buffer;
+  request->output = output;
+  request->capacity = nbytes;
+  request->connect_timeout_ms =
+      options.connect_timeout > 0 ? static_cast<long>(options.connect_timeout * 1000) : 0;
+  request->request_timeout_ms =
+      options.request_timeout > 0 ? static_cast<long>(options.request_timeout * 1000) : 0;
+  request->client_lock_holder = std::move(client_lock_holder);
+  auto headers = http_request.GetHeaders();
+  request->headers.reserve(headers.size());
+  for (const auto& header : headers) {
+    request->headers.push_back(std::string(header.first.c_str()) + ": " + std::string(header.second.c_str()));
+  }
+  return request;
+}
+
+DetachedCurlTask RunCurlMultiGetObject(std::shared_ptr<CurlMultiReadExecutor> executor,
+                                       std::shared_ptr<CurlMultiRequest> request,
+                                       Future<std::shared_ptr<Buffer>> future,
+                                       std::shared_ptr<ResizableBuffer> buffer,
+                                       int64_t expected_length) {
+  try {
+    auto result = co_await executor->GetObject(request);
+    if (!result.ok) {
+      future.MarkFinished(arrow::Status::IOError("curl_multi GetObject failed: ", result.error));
+      co_return;
+    }
+    if (result.bytes > expected_length) {
+      future.MarkFinished(arrow::Status::IOError("curl_multi GetObject returned more bytes than requested"));
+      co_return;
+    }
+    auto resize_status = buffer->Resize(result.bytes);
+    if (!resize_status.ok()) {
+      future.MarkFinished(resize_status);
+      co_return;
+    }
+    future.MarkFinished(std::static_pointer_cast<Buffer>(buffer));
+  } catch (const std::exception& e) {
+    future.MarkFinished(arrow::Status::IOError("curl_multi GetObject exception: ", e.what()));
+  } catch (...) {
+    future.MarkFinished(arrow::Status::IOError("curl_multi GetObject unknown exception"));
+  }
+}
+
+DetachedCurlTask RunCurlMultiGetObjectInto(std::shared_ptr<CurlMultiReadExecutor> executor,
+                                           std::shared_ptr<CurlMultiRequest> request,
+                                           int64_t expected_length,
+                                           MilvusStorageReadAsyncIntoCallback callback,
+                                           void* callback_ctx) {
+  try {
+    auto result = co_await executor->GetObject(request);
+    if (!result.ok) {
+      auto error = std::string("curl_multi GetObjectInto failed: ") + result.error;
+      callback(callback_ctx, -1, error.c_str());
+      co_return;
+    }
+    if (result.bytes <= 0 || result.bytes > expected_length) {
+      callback(callback_ctx, -1, "curl_multi GetObjectInto returned invalid byte count");
+      co_return;
+    }
+    callback(callback_ctx, result.bytes, nullptr);
+  } catch (const std::exception& e) {
+    auto error = std::string("curl_multi GetObjectInto exception: ") + e.what();
+    callback(callback_ctx, -1, error.c_str());
+  } catch (...) {
+    callback(callback_ctx, -1, "curl_multi GetObjectInto unknown exception");
+  }
+}
+
+class S3CrtReadClient {
+ public:
+  explicit S3CrtReadClient(const S3Options& options, const S3ReadPathContext& context) {
+    if (options.cloud_provider != "aws") {
+      throw std::runtime_error("S3CrtClient GetObjectAsync demo currently supports AWS S3 only");
+    }
+    if (!options.credentials_provider) {
+      throw std::runtime_error("S3CrtClient GetObjectAsync requires an AWS credentials provider");
+    }
+
+    const auto event_loops =
+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_CRT_EVENTLOOPS", 2, context));
+    const auto max_connections =
+        std::max<uint64_t>(1, GetUnsignedEnv("MILVUS_S3_CLIENT_CRT_MAX_CONNECTIONS", options.max_connections, context));
+    const auto throughput_gbps = GetDoubleEnv("MILVUS_S3_CLIENT_CRT_THROUGHPUT_GBPS", 30.0, context);
+
+    Aws::S3Crt::ClientConfiguration config;
+    if (!options.region.empty()) {
+      config.region = ToAwsString(options.region);
+    }
+    if (!options.endpoint_override.empty()) {
+      config.endpointOverride = ToAwsString(options.endpoint_override);
+    }
+    if (options.scheme == "http") {
+      config.scheme = Aws::Http::Scheme::HTTP;
+      config.verifySSL = false;
+    } else if (options.scheme == "https") {
+      config.scheme = Aws::Http::Scheme::HTTPS;
+      config.verifySSL = true;
+    } else {
+      throw std::runtime_error("Invalid S3 connection scheme for S3CrtClient GetObjectAsync");
+    }
+    if (options.connect_timeout > 0) {
+      config.connectTimeoutMs = static_cast<long>(std::ceil(options.connect_timeout * 1000));
+    }
+    if (options.request_timeout > 0) {
+      config.requestTimeoutMs = static_cast<long>(std::ceil(options.request_timeout * 1000));
+    }
+    config.maxConnections = static_cast<unsigned>(max_connections);
+    config.throughputTargetGbps = throughput_gbps;
+
+    event_loop_group_ =
+        std::make_unique<Aws::Crt::Io::EventLoopGroup>(static_cast<uint16_t>(event_loops));
+    host_resolver_ =
+        std::make_unique<Aws::Crt::Io::DefaultHostResolver>(*event_loop_group_, 64, 30);
+    bootstrap_ =
+        std::make_shared<Aws::Crt::Io::ClientBootstrap>(*event_loop_group_, *host_resolver_);
+    config.clientBootstrap = bootstrap_;
+
+    const bool use_virtual_addressing = options.endpoint_override.empty() || options.force_virtual_addressing;
+    client_ = std::make_shared<Aws::S3Crt::S3CrtClient>(
+        options.credentials_provider,
+        config,
+        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+        use_virtual_addressing);
+  }
+
+  Aws::S3Crt::S3CrtClient* get() const { return client_.get(); }
+
+ private:
+  std::unique_ptr<Aws::Crt::Io::EventLoopGroup> event_loop_group_;
+  std::unique_ptr<Aws::Crt::Io::DefaultHostResolver> host_resolver_;
+  std::shared_ptr<Aws::Crt::Io::ClientBootstrap> bootstrap_;
+  std::shared_ptr<Aws::S3Crt::S3CrtClient> client_;
+};
+
+arrow::Result<std::shared_ptr<S3CrtReadClient>> GetS3CrtReadClient(const S3Options& options,
+                                                                   const S3ReadPathContext& context) {
+  static std::mutex mutex;
+  static std::shared_ptr<S3CrtReadClient> client;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!client) {
+    try {
+      client = std::make_shared<S3CrtReadClient>(options, context);
+    } catch (const std::exception& e) {
+      return arrow::Status::Invalid(e.what());
+    }
+  }
+  return client;
+}
+
+void RunS3CrtGetObject(const S3Options& options,
+                       const S3Path& path,
+                       int64_t position,
+                       int64_t nbytes,
+                       Future<std::shared_ptr<Buffer>> future,
+                       std::shared_ptr<ResizableBuffer> buffer,
+                       std::shared_ptr<S3ClientLock> client_lock_holder,
+                       const S3ReadPathContext& context) {
+  auto maybe_client = GetS3CrtReadClient(options, context);
+  if (!maybe_client.ok()) {
+    future.MarkFinished(maybe_client.status());
+    return;
+  }
+
+  auto request = std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
+  request->SetBucket(ToAwsString(path.bucket));
+  request->SetKey(ToAwsString(path.key));
+  request->SetRange(ToAwsString(FormatRange(position, nbytes)));
+  request->SetResponseStreamFactory(AwsWriteableStreamFactory(buffer->mutable_data(), nbytes));
+
+  maybe_client.ValueOrDie()->get()->GetObjectAsync(
+      *request,
+      [future, request, buffer, length = nbytes, client_lock_holder](
+          const Aws::S3Crt::S3CrtClient*,
+          const Aws::S3Crt::Model::GetObjectRequest&,
+          Aws::S3Crt::Model::GetObjectOutcome outcome,
+          const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) mutable {
+        if (!outcome.IsSuccess()) {
+          future.MarkFinished(ErrorToStatus("GetObject", outcome.GetError()));
+          return;
+        }
+
+        auto& stream = outcome.GetResult().GetBody();
+        stream.ignore(length);
+        const auto bytes_read = static_cast<int64_t>(stream.gcount());
+        if (bytes_read <= 0 || bytes_read > length) {
+          future.MarkFinished(arrow::Status::IOError("S3CrtClient GetObjectAsync returned invalid byte count"));
+          return;
+        }
+
+        auto resize_status = buffer->Resize(bytes_read);
+        if (!resize_status.ok()) {
+          future.MarkFinished(resize_status);
+          return;
+        }
+
+        future.MarkFinished(std::static_pointer_cast<Buffer>(buffer));
+      });
+}
+
+void RunS3CrtGetObjectInto(const S3Options& options,
+                           const S3Path& path,
+                           int64_t position,
+                           int64_t nbytes,
+                           void* output,
+                           std::shared_ptr<S3ClientLock> client_lock_holder,
+                           const S3ReadPathContext& context,
+                           MilvusStorageReadAsyncIntoCallback callback,
+                           void* callback_ctx) {
+  auto maybe_client = GetS3CrtReadClient(options, context);
+  if (!maybe_client.ok()) {
+    auto error = maybe_client.status().ToString();
+    callback(callback_ctx, -1, error.c_str());
+    return;
+  }
+
+  auto request = std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
+  request->SetBucket(ToAwsString(path.bucket));
+  request->SetKey(ToAwsString(path.key));
+  request->SetRange(ToAwsString(FormatRange(position, nbytes)));
+  request->SetResponseStreamFactory(AwsWriteableStreamFactory(output, nbytes));
+
+  maybe_client.ValueOrDie()->get()->GetObjectAsync(
+      *request,
+      [request, length = nbytes, client_lock_holder, callback, callback_ctx](
+          const Aws::S3Crt::S3CrtClient*,
+          const Aws::S3Crt::Model::GetObjectRequest&,
+          Aws::S3Crt::Model::GetObjectOutcome outcome,
+          const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) mutable {
+        if (!outcome.IsSuccess()) {
+          auto error = ErrorToStatus("GetObject", outcome.GetError()).ToString();
+          callback(callback_ctx, -1, error.c_str());
+          return;
+        }
+
+        auto& stream = outcome.GetResult().GetBody();
+        stream.ignore(length);
+        const auto bytes_read = static_cast<int64_t>(stream.gcount());
+        if (bytes_read <= 0 || bytes_read > length) {
+          callback(callback_ctx, -1, "S3CrtClient GetObjectAsyncInto returned invalid byte count");
+          return;
+        }
+        callback(callback_ctx, bytes_read, nullptr);
+      });
+}
+
+
 arrow::Result<S3Model::GetObjectResult> GetObjectRange(
     Aws::S3::S3Client* client, const S3Path& path, int64_t start, int64_t length, void* out) {
   S3Model::GetObjectRequest req;
@@ -365,9 +1323,30 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
   public:
   ObjectInputFile(std::shared_ptr<S3ClientHolder> holder,
                   const arrow::io::IOContext& io_context,
+                  S3Options options,
                   const S3Path& path,
                   int64_t size = kNoSize)
-      : holder_(std::move(holder)), io_context_(io_context), path_(path), content_length_(size) {}
+      : holder_(std::move(holder)),
+        io_context_(io_context),
+        options_(std::move(options)),
+        path_(path),
+        content_length_(size) {}
+
+  void SetS3ReadPathContext(const char* mode,
+                            uint64_t max_inflight,
+                            uint64_t event_loops,
+                            uint64_t crt_max_connections,
+                            double crt_throughput_gbps,
+                            bool has_crt_throughput_gbps) {
+    std::lock_guard<std::mutex> lock(s3_read_path_context_mutex_);
+    s3_read_path_context_.override_enabled = true;
+    s3_read_path_context_.mode = mode == nullptr ? std::string() : std::string(mode);
+    s3_read_path_context_.max_inflight = max_inflight;
+    s3_read_path_context_.event_loops = event_loops;
+    s3_read_path_context_.crt_max_connections = crt_max_connections;
+    s3_read_path_context_.crt_throughput_gbps = crt_throughput_gbps;
+    s3_read_path_context_.has_crt_throughput_gbps = has_crt_throughput_gbps;
+  }
 
   arrow::Status Init() {
     // Issue a HEAD Object to get the content-length and ensure any
@@ -458,6 +1437,14 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
     if (nbytes == 0) {
       return 0;
     }
+    if (IsS3ReadPathLogEnabled()) {
+      S3ReadPathContext s3_read_path_context;
+      {
+        std::lock_guard<std::mutex> lock(s3_read_path_context_mutex_);
+        s3_read_path_context = s3_read_path_context_;
+      }
+      PrintS3ReadPathSelection("baseline", s3_read_path_context, position, nbytes);
+    }
 
     // Read the desired range of bytes
     ARROW_ASSIGN_OR_RAISE(auto client_lock, holder_->Lock());
@@ -469,6 +1456,182 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
     // NOTE: the stream is a stringstream by default, there is no actual error
     // to check for.  However, stream.fail() may return true if EOF is reached.
     return stream.gcount();
+  }
+
+
+  Future<std::shared_ptr<Buffer>> ReadAsync(const arrow::io::IOContext& io_context,
+                                            int64_t position,
+                                            int64_t nbytes) override {
+    S3ReadPathContext s3_read_path_context;
+    {
+      std::lock_guard<std::mutex> lock(s3_read_path_context_mutex_);
+      s3_read_path_context = s3_read_path_context_;
+    }
+
+    if (!IsEnvEnabled("MILVUS_S3_GETOBJECT_ASYNC", s3_read_path_context)) {
+      PrintS3ReadPathSelection("baseline", s3_read_path_context, position, nbytes);
+      return arrow::io::RandomAccessFile::ReadAsync(io_context, position, nbytes);
+    }
+
+    auto checked = CheckClosed();
+    if (!checked.ok()) {
+      return Future<std::shared_ptr<Buffer>>::MakeFinished(
+          arrow::Result<std::shared_ptr<Buffer>>(checked));
+    }
+    checked = CheckPosition(position, "read");
+    if (!checked.ok()) {
+      return Future<std::shared_ptr<Buffer>>::MakeFinished(
+          arrow::Result<std::shared_ptr<Buffer>>(checked));
+    }
+
+    nbytes = std::min(nbytes, content_length_ - position);
+    if (nbytes == 0) {
+      return Future<std::shared_ptr<Buffer>>::MakeFinished(std::make_shared<Buffer>(nullptr, 0));
+    }
+
+    auto maybe_buffer = AllocateResizableBuffer(nbytes, io_context.pool());
+    if (!maybe_buffer.ok()) {
+      return Future<std::shared_ptr<Buffer>>::MakeFinished(
+          arrow::Result<std::shared_ptr<Buffer>>(maybe_buffer.status()));
+    }
+    auto unique_buffer = maybe_buffer.MoveValueUnsafe();
+    auto buffer = std::shared_ptr<ResizableBuffer>(std::move(unique_buffer));
+
+    auto maybe_client_lock = holder_->Lock();
+    if (!maybe_client_lock.ok()) {
+      return Future<std::shared_ptr<Buffer>>::MakeFinished(
+          arrow::Result<std::shared_ptr<Buffer>>(maybe_client_lock.status()));
+    }
+    auto client_lock = maybe_client_lock.MoveValueUnsafe();
+    auto* client = client_lock.get();
+    auto client_lock_holder = std::make_shared<S3ClientLock>(std::move(client_lock));
+
+    auto future = Future<std::shared_ptr<Buffer>>::Make();
+    if (IsEnvEnabled("MILVUS_S3_CLIENT_CRT", s3_read_path_context)) {
+      PrintS3ReadPathSelection("crt", s3_read_path_context, position, nbytes);
+      RunS3CrtGetObject(options_, path_, position, nbytes, future, buffer, client_lock_holder, s3_read_path_context);
+      return future;
+    }
+    if (IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE", s3_read_path_context)) {
+      PrintS3ReadPathSelection("curl_multi", s3_read_path_context, position, nbytes);
+      auto maybe_request =
+          BuildCurlMultiGetObjectRequest(options_, path_, position, nbytes, buffer, nullptr, client_lock_holder);
+      if (!maybe_request.ok()) {
+        return Future<std::shared_ptr<Buffer>>::MakeFinished(
+            arrow::Result<std::shared_ptr<Buffer>>(maybe_request.status()));
+      }
+      RunCurlMultiGetObject(GetCurlMultiReadExecutor(s3_read_path_context),
+                            maybe_request.MoveValueUnsafe(),
+                            future,
+                            buffer,
+                            nbytes);
+      return future;
+    }
+
+    S3Model::GetObjectRequest req;
+    req.SetBucket(ToAwsString(path_.bucket));
+    req.SetKey(ToAwsString(path_.key));
+    req.SetRange(ToAwsString(FormatRange(position, nbytes)));
+    req.SetResponseStreamFactory(AwsWriteableStreamFactory(buffer->mutable_data(), nbytes));
+
+    PrintS3ReadPathSelection("aws_async", s3_read_path_context, position, nbytes);
+    client->GetObjectAsync(
+        req,
+        [future, buffer, length = nbytes, client_lock_holder](
+            const Aws::S3::S3Client*,
+            const S3Model::GetObjectRequest&,
+            const S3Model::GetObjectOutcome& outcome,
+            const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) mutable {
+          if (!outcome.IsSuccess()) {
+            future.MarkFinished(ErrorToStatus("GetObject", outcome.GetError()));
+            return;
+          }
+          auto& stream = outcome.GetResult().GetBody();
+          stream.ignore(length);
+          const auto bytes_read = stream.gcount();
+          auto resize_status = buffer->Resize(bytes_read);
+          if (!resize_status.ok()) {
+            future.MarkFinished(resize_status);
+            return;
+          }
+          future.MarkFinished(std::static_pointer_cast<Buffer>(buffer));
+        });
+
+    return future;
+  }
+
+  bool ReadAsyncInto(int64_t position,
+                     int64_t nbytes,
+                     void* output,
+                     MilvusStorageReadAsyncIntoCallback callback,
+                     void* callback_ctx) {
+    S3ReadPathContext s3_read_path_context;
+    {
+      std::lock_guard<std::mutex> lock(s3_read_path_context_mutex_);
+      s3_read_path_context = s3_read_path_context_;
+    }
+
+    if (!IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE", s3_read_path_context) &&
+        !IsEnvEnabled("MILVUS_S3_CLIENT_CRT", s3_read_path_context)) {
+      return false;
+    }
+
+    auto checked = CheckClosed();
+    if (!checked.ok()) {
+      auto error = checked.ToString();
+      callback(callback_ctx, -1, error.c_str());
+      return true;
+    }
+    checked = CheckPosition(position, "read");
+    if (!checked.ok()) {
+      auto error = checked.ToString();
+      callback(callback_ctx, -1, error.c_str());
+      return true;
+    }
+
+    nbytes = std::min(nbytes, content_length_ - position);
+    if (nbytes == 0) {
+      callback(callback_ctx, 0, nullptr);
+      return true;
+    }
+
+    auto maybe_client_lock = holder_->Lock();
+    if (!maybe_client_lock.ok()) {
+      auto error = maybe_client_lock.status().ToString();
+      callback(callback_ctx, -1, error.c_str());
+      return true;
+    }
+    auto client_lock = maybe_client_lock.MoveValueUnsafe();
+    auto client_lock_holder = std::make_shared<S3ClientLock>(std::move(client_lock));
+
+    if (IsEnvEnabled("MILVUS_S3_CLIENT_COROUTINE", s3_read_path_context)) {
+      PrintS3ReadPathSelection("curl_multi", s3_read_path_context, position, nbytes);
+      auto maybe_request =
+          BuildCurlMultiGetObjectRequest(options_, path_, position, nbytes, nullptr, output, client_lock_holder);
+      if (!maybe_request.ok()) {
+        auto error = maybe_request.status().ToString();
+        callback(callback_ctx, -1, error.c_str());
+        return true;
+      }
+      RunCurlMultiGetObjectInto(GetCurlMultiReadExecutor(s3_read_path_context),
+                                maybe_request.MoveValueUnsafe(),
+                                nbytes,
+                                callback,
+                                callback_ctx);
+      return true;
+    }
+
+    PrintS3ReadPathSelection("crt_direct_into", s3_read_path_context, position, nbytes);
+    RunS3CrtGetObjectInto(options_,
+                          path_,
+                          position,
+                          nbytes,
+                          output,
+                          client_lock_holder,
+                          s3_read_path_context,
+                          callback,
+                          callback_ctx);
+    return true;
   }
 
   arrow::Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
@@ -503,13 +1666,56 @@ class ObjectInputFile final : public arrow::io::RandomAccessFile {
   protected:
   std::shared_ptr<S3ClientHolder> holder_;
   const arrow::io::IOContext io_context_;
+  const S3Options options_;
   S3Path path_;
 
   bool closed_ = false;
   int64_t pos_ = 0;
   int64_t content_length_ = kNoSize;
   std::shared_ptr<const arrow::KeyValueMetadata> metadata_;
+  mutable std::mutex s3_read_path_context_mutex_;
+  S3ReadPathContext s3_read_path_context_;
 };
+
+extern "C" void milvus_storage_set_s3_read_path_context_for_file(
+    void* file,
+    const char* mode,
+    uint64_t max_inflight,
+    uint64_t event_loops,
+    uint64_t crt_max_connections,
+    double crt_throughput_gbps,
+    bool has_crt_throughput_gbps) {
+  auto* random_access_file = static_cast<arrow::io::RandomAccessFile*>(file);
+  auto* object_input_file = dynamic_cast<milvus_storage::ObjectInputFile*>(random_access_file);
+  if (object_input_file == nullptr) {
+    return;
+  }
+  object_input_file->SetS3ReadPathContext(mode,
+                                          max_inflight,
+                                          event_loops,
+                                          crt_max_connections,
+                                          crt_throughput_gbps,
+                                          has_crt_throughput_gbps);
+}
+
+extern "C" bool milvus_storage_read_async_into_file(
+    void* file,
+    int64_t position,
+    int64_t nbytes,
+    void* output,
+    MilvusStorageReadAsyncIntoCallback callback,
+    void* callback_ctx) {
+  auto* random_access_file = static_cast<arrow::io::RandomAccessFile*>(file);
+  auto* object_input_file = dynamic_cast<milvus_storage::ObjectInputFile*>(random_access_file);
+  if (object_input_file == nullptr || output == nullptr || callback == nullptr) {
+    return false;
+  }
+  return object_input_file->ReadAsyncInto(position,
+                                          nbytes,
+                                          output,
+                                          callback,
+                                          callback_ctx);
+}
 
 void FileObjectToInfo(std::string_view key, const S3Model::HeadObjectResult& obj, FileInfo* info) {
   if (IsDirectory(key, obj)) {
@@ -1951,7 +3157,7 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
 
     ARROW_RETURN_NOT_OK(CheckS3Initialized());
 
-    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path);
+    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), options(), path);
     ARROW_RETURN_NOT_OK(ptr->Init());
     return ptr;
   }
@@ -1970,7 +3176,7 @@ class MultiPartUploadS3FS::Impl : public std::enable_shared_from_this<MultiPartU
 
     ARROW_RETURN_NOT_OK(CheckS3Initialized());
 
-    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), path, info.size());
+    auto ptr = std::make_shared<ObjectInputFile>(holder_, fs->io_context(), options(), path, info.size());
     ARROW_RETURN_NOT_OK(ptr->Init());
     return ptr;
   }
